@@ -1,0 +1,116 @@
+Windows 网络全流程测试工具 v1.0
+================================
+
+运行环境
+--------
+Windows 10/11，Python 3.10 或更新版本，Npcap（启用 WinPcap API 兼容支持）。
+实际测试建议使用管理员终端和独立有线测试网卡；只在自己有权测试的网络使用。
+不修改 Windows IP、DNS、路由或拨号配置；不影响 SDK 构建。
+
+在本目录打开终端，新机器首次安装：
+    py -3 -m venv .venv
+    .venv\Scripts\python.exe -m pip install -r requirements.txt
+
+当前开发机器的 .venv 已安装依赖；复制工具到其他机器时不要复制虚拟环境，重新执行安装命令。
+
+列出接口与查看帮助
+------------------
+    .\run.cmd interfaces
+    .\run.cmd dhcp --help
+    .\run.cmd pppoe --help
+    .\run.cmd ping --help
+
+--iface 可填写 Windows 接口索引（INDEX 列）、精确网卡名或 GUID。
+例如 --iface 9 或 --iface "以太网 3"。接口索引可能随系统重装/网卡更换变化，运行前先确认。
+不会根据系统默认路由自动选择网卡。
+
+DHCP 获取、续租、释放
+-------------------
+    .\run.cmd dhcp --iface 9 --vlan 100
+    .\run.cmd dhcp --iface "以太网 3" --vlan 100 --pcp 3 --renew-delay 5 --ping 192.0.2.1 --json dhcp-result.json
+
+流程：DISCOVER -> OFFER -> REQUEST -> ACK -> ARP 地址冲突探测 -> 主动续租 REQUEST/ACK
+      -> 可选 Ping -> RELEASE。
+单播续租超时会尝试广播 rebind，可接受另一个 DHCP 服务器的合法 ACK；NAK 会终止流程。
+默认立即执行主动续租，这是加速测试，不代表实际等待租约 T1/T2；--renew-delay 需小于租约剩余时间。
+收到冲突探测回应时发送 DECLINE，不使用冲突地址。
+RELEASE 没有应答包，报告中的 release_sent 仅表示本机发送成功，并非服务器确认已释放。
+DHCP --ping 可省略；省略时只测试 DHCP 流程。
+
+PPPoE 完整拨号、Ping、断开
+------------------------
+    .\run.cmd pppoe --iface 9 --vlan 200 --username testuser --ping 198.51.100.1
+    .\run.cmd pppoe --iface "以太网 3" --vlan 200 --username testuser --service internet --ac-name test-ac --count 10 --json pppoe-result.json
+
+流程：PADI -> PADO -> PADR -> PADS -> LCP 双向协商 -> PAP / CHAP-MD5 认证
+      -> IPCP 地址/DNS 协商 -> PPP 会话内 ICMP Echo -> LCP Terminate -> PADT。
+支持 AC 不要求认证的情况；--username 仍需提供。
+不传 --ping 时使用协商到的对端 IPv4；有些 AC 不响应 Ping，可显式指定实际可达的网络地址。
+PPP 通道是点对点，不使用 ARP。不将拨号结果注册为 Windows 网络接口。
+--service 为空时请求任意服务，--ac-name 可限定接入集中器。
+
+密码默认从环境变量 NETTEST_PPPOE_PASSWORD 读取；未设置时在交互式终端隐藏输入。
+不要通过聊天、命令行参数或脚本硬编码明文密码。
+自动化脚本可用 --password-env 指定另一环境变量名（变量值由你的安全运行环境提供）。
+PAP 密码在线路上本身是明文；CHAP-MD5 是兼容旧设备的认证协议，不提供链路加密。
+不支持 MS-CHAP、MS-CHAPv2、EAP；遇到这些认证会明确失败，不会错误标记成功。
+
+独立 IPv4 Ping
+-------------
+同网段：
+    .\run.cmd ping --iface 9 --vlan 100 --src-ip 192.0.2.10 --netmask 255.255.255.0 --target 192.0.2.1 --count 4
+跨网段：
+    .\run.cmd ping --iface 9 --vlan 100 --src-ip 192.0.2.10 --netmask 24 --gateway 192.0.2.1 --target 198.51.100.1 --count 10 --interval 1
+
+以上 192.0.2.x / 198.51.100.x 是文档示例地址，请替换成实际网络参数。
+--src-ip 必须是测试 VLAN 内合法且未被占用的地址，不要填 Windows 正在使用的地址。
+工具先检查地址冲突，然后 ARP 解析目标或网关，回复测试地址的 ARP，再发送 ICMP。
+只接受数字 IPv4，不使用 Windows DNS/路由；跨网段必须显式指定 --gateway。
+--size 表示 ICMP 数据长度（不含 20 字节 IPv4 + 8 字节 ICMP 头），默认 32。
+以太网最大 1472 字节、常规 PPPoE 最大 1464 字节，实际还受接口 MTU/对端 MRU 限制。
+不支持 IPv4 分片、IPv6 和域名解析。
+
+VLAN、MAC 与网卡注意事项
+----------------------
+不传 --vlan：发送不带标签的以太网帧。
+--vlan 1..4094：单层 802.1Q；--pcp 0..7：优先级，仅在设置 VLAN 时有效。
+不支持 QinQ 和 VID 0 priority-tagged 模式。
+默认使用随机本地管理单播 MAC，可用 --mac 02:11:22:33:44:55 固定测试身份。
+交换机 MAC 数量限制、端口安全、ONU 限制、驱动收发能力均可能阻止临时 MAC 流量。
+指定真实网卡 MAC 可能与 Windows 协议栈争抢地址/会话，优先使用独立测试网卡。
+
+并非所有 Windows 网卡都能透传软件生成的 VLAN 标签。
+驱动的 VLAN 配置、Priority & VLAN、硬件卸载可能导致标签被删除或重复添加。
+工具不自动改变这些高级属性；若超时，先核对端口 trunk/access 设置和驱动能力。
+本机 PCAP 记录的是软件侧观察到的帧，无法证明物理线路确实携带 VLAN；需要交换机镜像或外部抓包验证。
+不同 VLAN、非本测试 MAC 的回包将被过滤。普通 Wi-Fi 网卡不支持本工具的二层测试模式。
+
+诊断参数与结果
+--------------
+    .\run.cmd dhcp --iface 9 --vlan 100 --timeout 3 --retries 2 --json result.json --pcap capture.pcap
+
+--timeout：单次等待秒数，默认 3。
+--retries：额外重试次数，默认 2（即最多 3 次）；不用于自动重复整个拨号/租约流程。
+--count：Ping 次数；--interval：相邻 Echo 发送的最小间隔。
+每阶段显示 TX/RX/INFO/ERROR；结果包括协商 IP、服务器、RTT 和丢包统计。
+所有 Ping 请求收到有效应答才算 Ping PASS；部分丢包也返回失败。
+JSON、PCAP 路径必须不存在，防止覆盖已有结果；输出目录必须已存在。
+
+PCAP 仅在显式指定时开启，可能保存 PAP 明文密码、CHAP 认证材料和业务 IP/MAC。
+请限制文件访问，不要上传到公开系统；普通日志和 JSON 不包含密码或 CHAP 摘要。
+Ctrl+C 会尽力释放有效租约/断开已建立会话；断电、强制终止进程或驱动故障无法保证清理。
+
+退出码：
+    0  测试成功
+    1  协议/连通性失败、超时、丢包或接收队列溢出
+    2  参数/依赖/权限/文件/运行环境错误
+    130 用户中断
+
+离线验证
+--------
+在本目录执行：
+    .venv\Scripts\python.exe -m unittest discover -s tests -v
+
+测试使用 FakeLink 传输真实编码的报文，不向真实网卡发包；Windows 上还会只读枚举网卡。
+单元测试不能替代真实 DHCP 服务器/PPPoE AC 的互通测试，也不能证明网卡 VLAN 透传能力。
+当前交付未进行实际链路收发测试；需要明确接口、VLAN、目标和拨号账号后再验证。
