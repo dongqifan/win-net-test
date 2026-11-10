@@ -19,6 +19,7 @@ Windows 10/11，Python 3.10 或更新版本，Npcap（启用 WinPcap API 兼容�
     .\run.cmd dhcp --help
     .\run.cmd pppoe --help
     .\run.cmd ping --help
+    .\run.cmd repeat --help
 
 --iface 可填写 Windows 接口索引（INDEX 列）、精确网卡名或 GUID。
 例如 --iface 9 或 --iface "以太网 3"。接口索引可能随系统重装/网卡更换变化，运行前先确认。
@@ -28,6 +29,11 @@ DHCP 获取、续租、释放
 -------------------
     .\run.cmd dhcp --iface 9 --vlan 100
     .\run.cmd dhcp --iface "以太网 3" --vlan 100 --pcp 3 --renew-delay 5 --ping 192.0.2.1 --json dhcp-result.json
+
+默认 DHCP BROADCAST 回复标志为 0，表示客户端能接收单播回复；仅加 --broadcast 才置为 1，请求广播回复：
+    .\run.cmd dhcp --iface 9 --vlan 100 --broadcast
+该参数控制 Discover、选择地址的 Request 和 rebind Request 中的回复标志，不改变 Discover 本身的广播发送。
+单播续租和 RELEASE 保持回复标志为 0；服务器或中继仍按协议及自身策略决定最终回复方式。
 
 流程：DISCOVER -> OFFER -> REQUEST -> ACK -> ARP 地址冲突探测 -> 主动续租 REQUEST/ACK
       -> 可选 Ping -> RELEASE。
@@ -69,6 +75,54 @@ PAP 密码在线路上本身是明文；CHAP-MD5 是兼容旧设备的认证协�
 --size 表示 ICMP 数据长度（不含 20 字节 IPv4 + 8 字节 ICMP 头），默认 32。
 以太网最大 1472 字节、常规 PPPoE 最大 1464 字节，实际还受接口 MTU/对端 MRU 限制。
 不支持 IPv4 分片、IPv6 和域名解析。
+
+持续定频发包（repeat）
+--------------------
+用于路由设备内部抓包/hit 观察，向有权测试的设备持续发送固定类型报文。
+不会等待 DHCP OFFER、PPPoE PADO 或 Ping Reply 后才发下一包，也不重试完整协议流程。
+
+每 100ms 发送一个 DHCP Discover，持续到 Ctrl+C：
+    .\run.cmd repeat --protocol dhcp --iface 9 --interval-ms 100
+
+默认不设置 DHCP BROADCAST 回复位；只有要请求广播回复时才加 --broadcast：
+    .\run.cmd repeat --protocol dhcp --iface 9 --interval-ms 100 --broadcast
+两种方式都广播发送 Discover，区别仅是报文中的回复标志（0 或 0x8000）。
+
+指定 VLAN、固定测试 MAC，发送 100 次：
+    .\run.cmd repeat --protocol dhcp --iface 9 --vlan 100 --mac 02:11:22:33:44:55 --interval-ms 100 --count 100
+
+每 150ms 发送一个 PPPoE PADI，不拨号、不需要用户名密码：
+    .\run.cmd repeat --protocol pppoe --iface 9 --vlan 200 --interval-ms 150 --count 100
+    .\run.cmd repeat --protocol pppoe --iface 9 --service internet --interval-ms 100
+
+重复 ICMP Echo（IPv4 Ping），先做源地址冲突检查和一次 ARP 寻址：
+    .\run.cmd repeat --protocol ping --iface 9 --src-ip 192.0.2.10 --netmask 24 --target 192.0.2.1 --interval-ms 100 --count 100
+
+目标不回应 ARP，但已知下一跳 MAC 时，可指定 --dst-mac 跳过 ARP 寻址：
+    .\run.cmd repeat --protocol ping --iface 9 --src-ip 192.0.2.10 --netmask 24 --target 192.0.2.1 --dst-mac 02:aa:bb:cc:dd:ee --interval-ms 100
+
+跨网段仍需指定同网段 --gateway；--dst-mac 此时填写网关的 MAC，不是远端目标 MAC。
+即使指定 --dst-mac，也仍先检查源地址冲突；--src-ip 不能填 Windows 当前使用的地址。
+ARP 准备、地址冲突探测与必要的 ARP 应答不计入 --count；100ms 节奏仅指选定的测试报文。
+
+--interval-ms：100～60000 的整数毫秒，默认 1000；100ms 约每秒 10 个，150ms 等数值也可用。
+--count：0～2147483647，默认 0 表示持续发送；正数发送指定次数后结束。
+--timeout / --retries：仅影响 repeat ping 启动前的 ARP 准备，不会改变重复发包节奏。
+DHCP 仅重复 Discover，不发送 Request 或获取租约；PPPoE 仅重复 PADI，不建立会话。
+默认每次运行生成一个临时 MAC，并在运行期间保持不变；指定 --mac 可在多次运行间保持一致。
+DHCP XID、PPPoE Host-Uniq 和 Ping 标识在单次运行内固定，Ping 序列号递增并按 16 位回绕。
+
+每秒最多输出一次发送进度；结束或 Ctrl+C 显示 sent、实际发送间隔最小/平均/最大值、迟到与跳过时隙数。
+sent 仅计发送接口成功返回的测试报文，不证明设备已收到；received_frames 是接收帧计数，不等于有效回复数。
+repeat 的 PASS 只表示本地发送流程完成，不代表 DHCP/PPPoE/Ping 连通性通过。
+--json 保存最终/中断统计及最近 100 条事件；运行时事件仍显示在终端，Ctrl+C 退出码为 130。
+--pcap 仍可保存收发帧，但持续模式下抓包文件会不断增大，请监控磁盘空间，勿上传抓包。
+
+定时使用高分辨率单调时钟与短时 sleep，以发送起点安排下一次发送，避免叠加发包耗时。
+Windows 上建议 Python 3.11+，其 sleep 使用高分辨率等待计时器；Python 3.10 的等待粒度可能更粗。
+系统迟到或发送超时时跳过已错过时隙，不突发补发；不等待协议回应，不保证硬实时。
+Windows 调度、网卡驱动、控制台/磁盘 I/O 可能使实际间隔超过设定值；软件统计不等于物理线路时间戳。
+要确认线路上确实每 100ms 收到带正确 VLAN 的报文，需要路由设备 hit、镜像口或外部抓包验证。
 
 VLAN、MAC 与网卡注意事项
 ----------------------

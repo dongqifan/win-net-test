@@ -96,7 +96,9 @@ class DhcpClient:
         self.lease, self.channel = None, None
         self.expires, self.release_sent = 0, False
 
-    def request(self, kind, server=None, requested=None, ciaddr="0.0.0.0", broadcast=True):
+    def request(self, kind, server=None, requested=None, ciaddr="0.0.0.0", broadcast=None):
+        if broadcast is None:
+            broadcast = self.options.broadcast if kind in (1, 3) else False
         data = bytearray(236)
         data[:4] = b"\x01\x01\x06\0"
         struct.pack_into("!IHH", data, 4, self.xid, min(65535, int(self.link.clock() - self.started)),

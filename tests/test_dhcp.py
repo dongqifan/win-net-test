@@ -10,7 +10,7 @@ from netprobe.report import ProbeError
 
 def options(**changes):
     values = dict(timeout=.1, retries=1, renew_delay=0, hostname="test-host", ping=None,
-                  count=1, interval=.1, size=32)
+                  count=1, interval=.1, size=32, broadcast=False)
     values.update(changes)
     return SimpleNamespace(**values)
 
@@ -96,6 +96,18 @@ class DhcpTests(unittest.TestCase):
         self.assertEqual(renewing[4], PEER)
         self.assertEqual(release[3][54], ip_bytes("192.0.2.1"))
         self.assertEqual(release[3][61], b"\x01" + mac_bytes(CLIENT))
+
+    def test_reply_broadcast_flag_is_opt_in_for_discover_and_requests(self):
+        for broadcast, flags in ((False, 0), (True, 0x8000)):
+            with self.subTest(broadcast=broadcast):
+                server = Server(rebind=True)
+                result = self.d.run_dhcp(FakeLink(server), options(broadcast=broadcast), quiet_report())
+                self.assertEqual(result["lease"]["server"], "192.0.2.2")
+                for kind, ip, data, opts, destination in server.requests:
+                    expected = flags if kind in (1, 3) and ip.dst == "255.255.255.255" else 0
+                    self.assertEqual(struct.unpack_from("!H", data, 10)[0], expected)
+                self.assertEqual(server.requests[0][1].dst, "255.255.255.255")
+                self.assertEqual(server.requests[0][4], "ff:ff:ff:ff:ff:ff")
 
     def test_renew_timeout_rebind_changes_server(self):
         server = Server(rebind=True)

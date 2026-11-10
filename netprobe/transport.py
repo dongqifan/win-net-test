@@ -59,11 +59,12 @@ $ips = @(Get-NetIPInterface -AddressFamily IPv4)
 
 
 class Link:
-    def __init__(self, interface, mac, vlan=None, pcp=0, pcap=None):
+    def __init__(self, interface, mac, vlan=None, pcp=0, pcap=None, precise_timing=False):
+        self.precise_timing = precise_timing
         self.mac, self.vlan, self.pcp = validate_mac(mac), vlan, pcp
         encode_frame(self.mac, self.mac, 0x0800, b"", vlan, pcp)
         self.mtu = min(interface.mtu, 1500)
-        self.clock = time.monotonic
+        self.clock = time.perf_counter if precise_timing else time.monotonic
         self.frames = queue.Queue(maxsize=4096)
         self.dropped = 0
         self.socket = self.sniffer = self.writer = None
@@ -131,11 +132,20 @@ class Link:
                 raise ProbeError("Npcap capture stopped unexpectedly")
             remaining = deadline - self.clock()
             if remaining <= 0:
+                if self.precise_timing and timeout > 0:
+                    try:
+                        return self.frames.get_nowait()
+                    except queue.Empty:
+                        pass
                 return None
             try:
+                if self.precise_timing:
+                    return self.frames.get_nowait()
                 return self.frames.get(timeout=min(remaining, 0.1))
             except queue.Empty:
-                pass
+                if self.precise_timing:
+                    # Windows queue timeouts are coarser than Python's waitable-timer sleep.
+                    time.sleep(min(remaining, .005))
 
     def close(self):
         try:

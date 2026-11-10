@@ -10,6 +10,7 @@ from . import __version__
 from .dhcp import run_dhcp
 from .ping import run_ping
 from .pppoe import run_pppoe
+from .repeat import run_repeat
 from .report import ProbeError, Report, safe_text
 from .transport import Link, list_interfaces, select_interface
 from .wire import random_mac, unicast_ip, validate_mac
@@ -44,10 +45,11 @@ def parser():
     root.add_argument("--version", action="version", version=__version__)
     commands = root.add_subparsers(dest="command", required=True)
     commands.add_parser("interfaces", help="List Windows adapter indices, names, GUIDs and status")
-    for name in ("dhcp", "pppoe", "ping"):
+    for name in ("dhcp", "pppoe", "ping", "repeat"):
         p = commands.add_parser(name, help={"dhcp": "DORA -> accelerated renew/rebind -> optional ping -> release",
                                           "pppoe": "Discovery -> LCP -> PAP/CHAP-MD5 -> IPCP -> ping -> disconnect",
-                                          "ping": "Address conflict probe -> ARP -> ICMP Echo statistics"}[name])
+                                          "ping": "Address conflict probe -> ARP -> ICMP Echo statistics",
+                                          "repeat": "Repeat DISCOVER / PADI / Echo without waiting for responses"}[name])
         p.add_argument("--iface", required=True, help="Windows ifIndex, exact adapter name or Npcap GUID")
         p.add_argument("--vlan", type=integer(1, 4094), help="802.1Q VLAN; omit for untagged frames")
         p.add_argument("--pcp", type=integer(0, 7), default=0, help="802.1p priority (requires --vlan)")
@@ -56,6 +58,25 @@ def parser():
         p.add_argument("--retries", type=integer(0, 10), default=2, help="Additional protocol/ARP retries (default: 2)")
         p.add_argument("--json", type=Path, help="Write a NEW JSON report file")
         p.add_argument("--pcap", type=Path, help="Write a NEW capture file; may contain PAP plaintext credentials")
+        if name in ("dhcp", "repeat"):
+            p.add_argument("--broadcast", action="store_true",
+                           help="DHCP: set BROADCAST reply flag (default clear; requests still broadcast)")
+        if name == "repeat":
+            p.add_argument("--protocol", choices=("dhcp", "pppoe", "ping"), required=True,
+                           help="Send DHCP DISCOVER, PPPoE PADI, or ICMP Echo only")
+            p.add_argument("--interval-ms", type=integer(100, 60000), default=1000,
+                           help="Minimum send-start interval in milliseconds; default 1000, best effort")
+            p.add_argument("--count", type=integer(0, 2147483647), default=0,
+                           help="Packets to send; 0 (default) runs until Ctrl+C")
+            p.add_argument("--hostname", help="DHCP hostname; default: win-net-test")
+            p.add_argument("--service", help="PPPoE Service-Name; default: any service")
+            p.add_argument("--src-ip", type=unicast_ip, help="Ping: unused static source IPv4")
+            p.add_argument("--netmask", help="Ping: subnet mask or prefix length")
+            p.add_argument("--gateway", type=unicast_ip, help="Ping: gateway for off-subnet targets")
+            p.add_argument("--target", type=unicast_ip, help="Ping: numeric unicast IPv4 target")
+            p.add_argument("--dst-mac", type=validate_mac, help="Ping: known next-hop MAC; skip ARP resolution")
+            p.add_argument("--size", type=integer(8, 1472), help="Ping: ICMP data bytes; default 32")
+            continue
         p.add_argument("--count", type=integer(1, 65535), default=4, help="Echo request count (default: 4)")
         p.add_argument("--interval", type=seconds(.05, 60), default=1, help="Minimum Echo start interval (seconds)")
         p.add_argument("--size", type=integer(8, 1472), default=32, help="ICMP data bytes, limited by interface/PPP MTU")
@@ -88,7 +109,24 @@ def validate(options):
     for path in outputs:
         if path.exists() or not path.parent.is_dir():
             raise ValueError(f"Output must be a new file with an existing parent directory: {path}")
-    if options.command == "dhcp":
+    protocol = options.command
+    if options.command == "repeat":
+        protocol = options.protocol
+        if options.broadcast and protocol != "dhcp":
+            raise ValueError("--broadcast is only valid for repeat dhcp")
+        allowed = {"dhcp": {"hostname"}, "pppoe": {"service"},
+                   "ping": {"src_ip", "netmask", "gateway", "target", "dst_mac", "size"}}[protocol]
+        for name in ("hostname", "service", "src_ip", "netmask", "gateway", "target", "dst_mac", "size"):
+            if getattr(options, name) is not None and name not in allowed:
+                raise ValueError(f"--{name.replace('_', '-')} is not valid for repeat {protocol}")
+        if protocol == "ping" and any(getattr(options, name) is None for name in ("src_ip", "netmask", "target")):
+            raise ValueError("repeat ping requires --src-ip, --netmask and --target")
+        options.hostname = "win-net-test" if options.hostname is None else options.hostname
+        options.service = "" if options.service is None else options.service
+        options.size = 32 if options.size is None else options.size
+        if len(options.service.encode("utf-8")) > 255:
+            raise ValueError("Service name must be at most 255 UTF-8 bytes")
+    if protocol == "dhcp":
         try:
             hostname = options.hostname.encode("ascii")
         except UnicodeEncodeError:
@@ -100,7 +138,7 @@ def validate(options):
             raise ValueError("Username must be at most 255 UTF-8 bytes")
         if len(options.service.encode("utf-8")) > 255 or (options.ac_name and len(options.ac_name.encode("utf-8")) > 255):
             raise ValueError("Service/AC name must be at most 255 UTF-8 bytes")
-    if options.command == "ping":
+    if protocol == "ping":
         network = ipaddress.IPv4Network(f"{options.src_ip}/{options.netmask}", strict=False)
         target = ipaddress.IPv4Address(options.target)
         if options.src_ip == options.target:
@@ -124,7 +162,8 @@ def main(argv=None):
     except ValueError as exc:
         print("Argument error: " + safe_text(exc), file=sys.stderr)
         return 2
-    report, link, code, active = Report(options.command), None, 2, False
+    report = Report(options.command, max_events=100 if options.command == "repeat" else None)
+    link, code, active = None, 2, False
     try:
         interfaces = list_interfaces()
         if options.command == "interfaces":
@@ -155,12 +194,15 @@ def main(argv=None):
             report.event("VLAN", "WARN", "Driver/offload may strip tags; wire-level VLAN delivery requires external verification")
         if options.pcap:
             report.event("PCAP", "WARN", "Capture may contain PAP plaintext password or CHAP material; protect this file")
-        link = Link(interface, mac, options.vlan, options.pcp, options.pcap)
+        link = Link(interface, mac, options.vlan, options.pcp, options.pcap,
+                    precise_timing=options.command == "repeat")
         active = True
         if options.command == "dhcp":
             result = run_dhcp(link, options, report)
         elif options.command == "pppoe":
             result = run_pppoe(link, options, report)
+        elif options.command == "repeat":
+            result = run_repeat(link, options, report)
         else:
             result = run_ping(link, options.src_ip, options.target, options.netmask, options.gateway,
                               options.count, options.interval, options.timeout, options.size, report, options.retries)
@@ -170,7 +212,8 @@ def main(argv=None):
         report.finish(success, result, None if success else "Protocol test failed, packets lost, or capture queue overflowed")
     except KeyboardInterrupt:
         code = 130
-        report.finish(False, error="Interrupted; attempted protocol cleanup")
+        report.finish(False, error="Repeat sending interrupted; partial statistics saved" if options.command == "repeat"
+                      else "Interrupted; attempted protocol cleanup")
     except (ProbeError, OSError, ValueError, ImportError, EOFError, TimeoutError) as exc:
         code = 1 if active and isinstance(exc, ProbeError) else 2
         report.finish(False, error=str(exc))

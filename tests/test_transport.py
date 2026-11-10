@@ -6,7 +6,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from netprobe.report import ProbeError
 from netprobe.transport import Link, list_interfaces
@@ -31,6 +31,44 @@ class TransportTests(unittest.TestCase):
         link.socket = SimpleNamespace(send=lambda packet: -1)
         link.ether = bytes
         return link
+
+    def test_precise_receive_waits_without_coarse_queue_timeouts(self):
+        class NonblockingQueue(queue.Queue):
+            def get(self, block=True, timeout=None):
+                if block:
+                    raise AssertionError("Precise waits must not use coarse queue timeouts")
+                return super().get(block=False)
+        link = self.make_link()
+        link.precise_timing, link.sniffer = True, None
+        link.frames = NonblockingQueue()
+        now, sleeps = [0.0], []
+        link.clock = lambda: now[0]
+        def sleep(delay):
+            sleeps.append(delay)
+            now[0] += delay
+        with patch("netprobe.transport.time.sleep", side_effect=sleep):
+            self.assertIsNone(link.recv(.012))
+        self.assertAlmostEqual(now[0], .012)
+        self.assertTrue(all(0 < delay <= .005 for delay in sleeps))
+        link.frames.put("frame")
+        with patch("netprobe.transport.time.sleep", side_effect=AssertionError("queued frame should return immediately")):
+            self.assertEqual(link.recv(.1), "frame")
+        link.capture_error = OSError("capture stopped")
+        with self.assertRaisesRegex(ProbeError, "capture stopped"):
+            link.recv(.1)
+
+    def test_precise_receive_returns_frame_arriving_during_final_sleep(self):
+        link = self.make_link()
+        link.precise_timing, link.sniffer = True, None
+        now = [0.0]
+        link.clock = lambda: now[0]
+        def sleep(delay):
+            now[0] += delay
+            if now[0] >= .01:
+                link.frames.put_nowait("last-moment frame")
+        with patch("netprobe.transport.time.sleep", side_effect=sleep):
+            self.assertEqual(link.recv(.01), "last-moment frame")
+        self.assertTrue(link.frames.empty())
 
     def test_npcap_negative_send_result_is_error(self):
         link = self.make_link()

@@ -18,8 +18,9 @@ def safe_text(value):
 
 
 class Report:
-    def __init__(self, command, stream=None):
+    def __init__(self, command, stream=None, max_events=None):
         self.stream = stream if stream is not None else sys.stdout
+        self.max_events = max_events
         self.started = time.monotonic()
         self.data = {"command": command, "started": datetime.now(timezone.utc).isoformat(),
                      "success": False, "events": [], "result": {}}
@@ -29,6 +30,8 @@ class Report:
         event = {"elapsed": elapsed, "stage": stage, "direction": direction,
                  "message": message, **fields}
         self.data["events"].append(event)
+        if self.max_events is not None and len(self.data["events"]) > self.max_events:
+            del self.data["events"][:len(self.data["events"]) - self.max_events]
         suffix = " ".join(f"{k}={safe_text(v)}" for k, v in fields.items())
         print(f"[{elapsed:8.3f}] {stage:12} {direction:5} {safe_text(message)} {suffix}".rstrip(),
               file=self.stream, flush=True)
